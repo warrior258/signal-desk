@@ -1,0 +1,25 @@
+# Virtual Environment
+venv/
+.venv/
+ENV/
+
+# Environment Variables
+.env
+
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# SQLite Database
+*.db
+data/*.db
+
+# Data & PDF files
+data/pdfs/
+*.pdf
+
+# Logs & temp files
+*.log
+.DS_Store
+Thumbs.db
