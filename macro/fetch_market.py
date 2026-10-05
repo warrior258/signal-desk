@@ -57,7 +57,8 @@ MACRO_CONFIG = {
 }
 
 
-def evaluate_status(key: str, val: float, change_30d: float, cfg: dict) -> str:
+def evaluate_status(key: str, val: float, change_30d: float, cfg: dict,
+                    drawdown_30d: float = 0.0) -> str:
     """
     Evaluates status (green, amber, red) using both absolute levels and rate-of-change.
     Avoids flagging benign values (e.g. low VIX with high % move).
@@ -85,9 +86,12 @@ def evaluate_status(key: str, val: float, change_30d: float, cfg: dict) -> str:
         return "green"
 
     if key == "nifty":
-        if change_30d <= cfg["red_dd"]:
+        # Drawdown from the 30d high, not first-vs-last change: a month that
+        # fell 9% then recovered 8% is calm, while one grinding down from its
+        # high is the stress we actually want flagged.
+        if drawdown_30d <= cfg["red_dd"]:
             return "red"
-        if change_30d <= cfg["amber_dd"]:
+        if drawdown_30d <= cfg["amber_dd"]:
             return "amber"
         return "green"
 
@@ -114,7 +118,9 @@ def fetch_macro_indicators() -> list[dict]:
 
             last_val = float(hist["Close"].iloc[-1])
             first_val = float(hist["Close"].iloc[0])
+            peak_val = float(hist["Close"].max())
             pct_change_30d = ((last_val - first_val) / first_val) * 100.0 if first_val > 0 else 0.0
+            drawdown_30d = ((last_val - peak_val) / peak_val) * 100.0 if peak_val > 0 else 0.0
 
             # 1. Sanity check: Plausibility range
             min_valid, max_valid = cfg["valid_range"]
@@ -123,16 +129,20 @@ def fetch_macro_indicators() -> list[dict]:
                 continue
 
             # 2. Sanity check: Staleness (older than 3 days, adjusting for weekends)
+            stale = False
+            as_of = None
             last_date = hist.index[-1]
             if hasattr(last_date, "to_pydatetime"):
                 last_dt = last_date.to_pydatetime()
                 if last_dt.tzinfo is None:
                     last_dt = last_dt.replace(tzinfo=timezone.utc)
+                as_of = last_dt.date().isoformat()
                 age_days = (now_utc - last_dt).total_seconds() / 86400.0
                 if age_days > 4.0:
+                    stale = True
                     print(f"[WARN] Stale data for {key} ({sym}): last update was {age_days:.1f} days ago.")
 
-            status = evaluate_status(key, last_val, pct_change_30d, cfg)
+            status = evaluate_status(key, last_val, pct_change_30d, cfg, drawdown_30d)
 
             item = {
                 "key": key,
@@ -141,7 +151,10 @@ def fetch_macro_indicators() -> list[dict]:
                 "symbol": sym,
                 "value": round(last_val, 2),
                 "change_30d_pct": round(pct_change_30d, 2),
+                "drawdown_30d_pct": round(drawdown_30d, 2),
                 "status": status,
+                "as_of": as_of,
+                "stale": stale,
                 "first_seen_at": now_iso
             }
             results.append(item)
@@ -186,4 +199,7 @@ if __name__ == "__main__":
     items = fetch_macro_indicators()
     for it in items:
         icon = "🔴" if it["status"] == "red" else "🟠" if it["status"] == "amber" else "🟢"
-        print(f"{icon} [{it['area']}] {it['name']}: {it['value']} ({it['change_30d_pct']:+.1f}% 30d) -> {it['status'].upper()}")
+        flag = " [STALE]" if it["stale"] else ""
+        print(f"{icon} [{it['area']}] {it['name']}: {it['value']} "
+              f"({it['change_30d_pct']:+.1f}% 30d, {it['drawdown_30d_pct']:+.1f}% from high) "
+              f"-> {it['status'].upper()} as_of {it['as_of']}{flag}")

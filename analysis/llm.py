@@ -16,9 +16,15 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from config import GEMINI_API_KEY
+from config import GEMINI_API_KEY, GEMINI_MODELS
 
 _CLIENT = None
+
+
+def is_available() -> bool:
+    """True if a Gemini key is configured. Lets callers skip analysis cleanly."""
+    return bool(GEMINI_API_KEY)
+
 
 def get_client():
     global _CLIENT
@@ -72,19 +78,26 @@ DOCUMENT TEXT:
 <<<TEXT>>>
 """
 
-MODELS_TO_TRY = ["gemini-3.5-flash-lite", "gemini-flash-latest"]
-
 def analyze_document(title: str, text: str) -> tuple[dict | None, str]:
     """
     Sends document text to Gemini LLM and extracts structured JSON analysis.
     Returns (parsed_dict, raw_json_str).
     """
-    client = get_client()
+    if not is_available():
+        print("[WARN] GEMINI_API_KEY not set; skipping LLM analysis.")
+        return None, ""
+
+    try:
+        client = get_client()
+    except ValueError as e:
+        print(f"[WARN] {e}")
+        return None, ""
+
     combined_text = f"TITLE: {title}\n\nCONTENT:\n{text}"[:15000]
     prompt = ANALYSIS_PROMPT.replace("<<<TEXT>>>", combined_text)
 
     last_error = None
-    for model_name in MODELS_TO_TRY:
+    for model_name in GEMINI_MODELS:
         try:
             response = client.models.generate_content(
                 model=model_name,
@@ -132,16 +145,28 @@ def analyze_document(title: str, text: str) -> tuple[dict | None, str]:
             parsed["companies"] = clean_company_list
             return parsed, cleaned
 
-        except (errors.APIError, Exception) as e:
+        except json.JSONDecodeError as e:
+            # Model replied, but not with usable JSON. Worth seeing in the logs.
+            last_error = e
+            print(f"[WARN] {model_name} returned non-JSON output: {e}")
+            continue
+        except errors.APIError as e:
             last_error = e
             continue
+        except Exception as e:
+            last_error = e
+            print(f"[WARN] {model_name} failed: {type(e).__name__}: {e}")
+            continue
 
-    print(f"[ERROR] LLM analysis failed across models: {last_error}")
+    print(f"[ERROR] LLM analysis failed across models {GEMINI_MODELS}: {last_error}")
     return None, ""
 
 if __name__ == "__main__":
     test_title = "Cabinet approves amendment in FDI policy for Space Sector"
     test_body = "The Union Cabinet approved up to 100% FDI in space sector for satellite manufacturing, operation, and launch vehicle launch pads."
+    if not is_available():
+        print("[INFO] GEMINI_API_KEY not set in .env; cannot run a live extraction test.")
+        raise SystemExit(0)
     data, raw = analyze_document(test_title, test_body)
     if data:
         print("Analysis succeeded!")

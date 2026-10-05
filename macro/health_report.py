@@ -40,7 +40,14 @@ def generate_health_summary(indicators: list[dict] = None) -> str:
         area = html.escape(str(ind["area"]))
         val = html.escape(str(ind["value"]))
         chg = ind["change_30d_pct"]
-        lines.append(f"{icon} <b>{area}</b>: {name} = <code>{val}</code> ({chg:+.1f}% 30d)")
+
+        # For Nifty the status is driven by drawdown, so show that number
+        detail = f"{chg:+.1f}% 30d"
+        if ind.get("key") == "nifty":
+            detail = f"{ind.get('drawdown_30d_pct', 0.0):+.1f}% from 30d high"
+
+        stale_flag = " ⏳<i>stale</i>" if ind.get("stale") else ""
+        lines.append(f"{icon} <b>{area}</b>: {name} = <code>{val}</code> ({detail}){stale_flag}")
 
     summary_header = "🚨 <b>MACRO STRESS ALERT</b>" if has_red else "🩺 <b>Economy health</b>"
     return f"{summary_header}\n" + "\n".join(lines)

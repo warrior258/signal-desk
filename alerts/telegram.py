@@ -1,6 +1,8 @@
-import requests
 import sys
+import time
 from pathlib import Path
+
+import requests
 
 # Ensure root directory is in sys.path
 root_dir = Path(__file__).resolve().parent.parent
@@ -17,15 +19,36 @@ if sys.platform == "win32":
 
 from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
-def send_alert(text: str, parse_mode: str = "HTML") -> bool:
-    """
-    Sends an alert message to the configured Telegram chat.
-    Returns True if sent successfully, False otherwise.
-    """
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[WARN] Telegram credentials not configured in .env (TELEGRAM_TOKEN, TELEGRAM_CHAT_ID).")
-        return False
+# Telegram rejects messages over 4096 characters; stay under it.
+TG_LIMIT = 4000
 
+
+def is_configured() -> bool:
+    """True if Telegram credentials are present."""
+    return bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
+
+
+def split_message(text: str, limit: int = TG_LIMIT) -> list[str]:
+    """
+    Splits text into Telegram-sized messages, preferring blank-line boundaries
+    and falling back to a hard cut for any single oversized block.
+    """
+    messages, current = [], ""
+    for block in text.split("\n\n"):
+        while len(block) > limit:
+            messages.append(block[:limit])
+            block = block[limit:]
+        if current and len(current) + len(block) + 2 > limit:
+            messages.append(current)
+            current = block
+        else:
+            current = f"{current}\n\n{block}" if current else block
+    if current:
+        messages.append(current)
+    return messages
+
+
+def _post(text: str, parse_mode: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -34,28 +57,51 @@ def send_alert(text: str, parse_mode: str = "HTML") -> bool:
         "disable_web_page_preview": True,
     }
 
-    response = None
-    try:
-        response = requests.post(url, json=payload, timeout=15)
-        response.raise_for_status()
-        return True
-    except requests.exceptions.RequestException as e:
-        print(f"[ERROR] Failed to send Telegram alert: {e}")
-        if response is not None and hasattr(response, "text"):
-            print(f"[ERROR] Telegram API Response: {response.text}")
+    for attempt in (1, 2):
+        response = None
+        try:
+            response = requests.post(url, json=payload, timeout=15)
+            # Honour rate limiting once before giving up
+            if response.status_code == 429 and attempt == 1:
+                retry_after = response.json().get("parameters", {}).get("retry_after", 2)
+                print(f"[WARN] Telegram rate limited; retrying in {retry_after}s.")
+                time.sleep(min(float(retry_after), 30.0))
+                continue
+            response.raise_for_status()
+            return True
+        except requests.exceptions.RequestException as e:
+            if attempt == 2:
+                print(f"[ERROR] Failed to send Telegram alert: {e}")
+                if response is not None:
+                    print(f"[ERROR] Telegram API Response: {response.text}")
+                return False
+            time.sleep(1)
+    return False
+
+
+def send_alert(text: str, parse_mode: str = "HTML") -> bool:
+    """
+    Sends an alert to the configured Telegram chat, splitting oversized
+    messages. Returns True only if every part was delivered.
+    """
+    if not is_configured():
+        print("[WARN] Telegram credentials not configured in .env (TELEGRAM_TOKEN, TELEGRAM_CHAT_ID).")
         return False
 
+    return all(_post(part, parse_mode) for part in split_message(text))
+
+
 if __name__ == "__main__":
-    print("Testing Telegram alert dispatch...")
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[INFO] Please edit your .env file and set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID first.")
+    # Splitting is testable without credentials
+    long_text = "\n\n".join(f"block {i} " + "x" * 300 for i in range(40))
+    parts = split_message(long_text)
+    assert all(len(p) <= TG_LIMIT for p in parts), "split produced an oversized part"
+    assert split_message("short") == ["short"]
+    assert len(split_message("y" * 9000)) == 3
+    print(f"Split tests passed ({len(parts)} parts from {len(long_text)} chars).")
+
+    if not is_configured():
+        print("[INFO] Set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID in .env to send a live test.")
     else:
-        test_msg = (
-            "🚀 <b>Policy Signal Bot — Connected!</b>\n\n"
-            "This is a test notification confirming Phase 1 Telegram integration is working."
-        )
-        ok = send_alert(test_msg)
-        if ok:
-            print("✅ Telegram test message sent successfully! Check your Telegram app.")
-        else:
-            print("❌ Failed to send Telegram test message. Check your token and chat ID in .env.")
+        ok = send_alert("🚀 <b>Policy Signal Bot — Connected!</b>\n\nTelegram integration is working.")
+        print("✅ Telegram test message sent!" if ok else "❌ Failed to send Telegram test message.")

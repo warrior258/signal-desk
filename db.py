@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 
@@ -15,7 +15,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from config import DB_PATH
+from config import DB_PATH, BACKLOG_MAX_AGE_HOURS
 
 def get_connection():
     """Returns a connection to the SQLite database with row_factory set to sqlite3.Row."""
@@ -150,21 +150,32 @@ def save_document(doc: dict) -> int:
             conn.commit()
             return cursor.lastrowid
         except sqlite3.IntegrityError:
-            cursor.execute("SELECT id FROM documents WHERE content_hash = ?;", (doc.get("content_hash"),))
+            # Either content_hash or url collided; look the existing row up by both.
+            cursor.execute(
+                "SELECT id FROM documents WHERE content_hash = ? OR url = ? LIMIT 1;",
+                (doc.get("content_hash"), doc.get("url", "").strip())
+            )
             row = cursor.fetchone()
             return row["id"] if row else -1
 
-def get_unanalyzed_documents(limit: int = 10) -> list[dict]:
-    """Retrieves documents that passed the filter but have not yet been analyzed."""
+def get_unanalyzed_documents(limit: int = 10,
+                            max_age_hours: int = BACKLOG_MAX_AGE_HOURS) -> list[dict]:
+    """
+    Retrieves recent documents that passed the filter but were never analyzed.
+
+    The age bound matters: without it a quiet news day would spend the LLM budget
+    re-reading a backlog of week-old policy items that are no longer tradeable.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
         SELECT id, source, title, url, content_hash, published_at, first_seen_at, raw_text
         FROM documents
-        WHERE passed_filter = 1 AND analyzed = 0
-        ORDER BY id DESC
+        WHERE passed_filter = 1 AND analyzed = 0 AND first_seen_at >= ?
+        ORDER BY first_seen_at DESC, id DESC
         LIMIT ?;
-        """, (limit,))
+        """, (cutoff, limit))
         return [dict(row) for row in cursor.fetchall()]
 
 def mark_document_filtered(doc_id: int, passed: bool):

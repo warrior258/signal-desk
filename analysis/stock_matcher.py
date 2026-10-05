@@ -13,11 +13,34 @@ from config import EQUITY_CSV_PATH
 
 NSE_EQUITY_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
 
+# Non-corporate entities the LLM often names. They are not tradeable, and fuzzy
+# matching used to map them onto unrelated tickers (e.g. "Food Corporation of
+# India" -> 3MINDIA), inventing signals out of nothing.
+_ENTITY_BLOCKLIST = re.compile(
+    r"\b(ministry|ministries|government|govt|cabinet|authority|department|"
+    r"commission|council|bureau|federation|association|parliament|"
+    r"secretariat|directorate|tribunal|regulator|niti aayog|"
+    r"rbi|sebi|trai|irdai|dgft|meity|morth|bis|fssai|cbic|cbdt)\b",
+    re.IGNORECASE,
+)
+
+# Dropped when normalising a name, so "State Bank of India" and "State Bank" agree.
+_NOISE_WORDS = re.compile(
+    r"\b(limited|ltd|pvt|private|industries|india|indian|corp|corporation|"
+    r"company|co|the|of|and)\b",
+    re.IGNORECASE,
+)
+
+MIN_CLEAN_LENGTH = 4   # below this a cleaned name carries too little signal
+FUZZY_CUTOFF = 88      # cleaned-name match
+STRICT_CUTOFF = 93     # token-set fallback, deliberately strict
+
 _CACHE_LOADED = False
 _NAMES = []
 _SYMBOLS = []
 _CLEANED_NAMES = []
 _EXACT_MAP = {}
+
 
 def ensure_equity_file():
     """Downloads EQUITY_L.csv from NSE if missing."""
@@ -33,12 +56,13 @@ def ensure_equity_file():
         except Exception as e:
             print(f"[WARN] Failed to download EQUITY_L.csv from NSE: {e}")
 
+
 def _clean_name(name: str) -> str:
-    """Normalizes company name for comparison."""
-    n = name.lower()
-    n = re.sub(r"\b(limited|ltd\.?|pvt\.?|private|industries|india|corp\.?|corporation)\b", "", n)
-    n = re.sub(r"[^\w\s]", "", n)
-    return n.strip()
+    """Normalizes a company name for comparison."""
+    n = _NOISE_WORDS.sub(" ", name.lower())
+    n = re.sub(r"[^\w\s]", " ", n)
+    return re.sub(r"\s+", " ", n).strip()
+
 
 def load_stocks():
     """Loads stocks into memory for fast fuzzy matching."""
@@ -59,15 +83,17 @@ def load_stocks():
         for row in reader:
             sym = row.get("SYMBOL", "").strip()
             name = row.get("NAME OF COMPANY", "").strip()
-            if sym and name:
-                names.append(name)
-                symbols.append(sym)
-                c_name = _clean_name(name)
-                cleaned.append(c_name)
-                exact_map[sym.upper()] = sym
-                exact_map[name.lower()] = sym
-                if c_name:
-                    exact_map[c_name] = sym
+            if not sym or not name:
+                continue
+            names.append(name)
+            symbols.append(sym)
+            c_name = _clean_name(name)
+            cleaned.append(c_name)
+            exact_map[sym.upper()] = sym
+            exact_map[name.lower()] = sym
+            # Don't let a short/ambiguous cleaned name claim an exact slot.
+            if len(c_name) >= MIN_CLEAN_LENGTH:
+                exact_map.setdefault(c_name, sym)
 
     _NAMES = names
     _SYMBOLS = symbols
@@ -75,65 +101,85 @@ def load_stocks():
     _EXACT_MAP = exact_map
     _CACHE_LOADED = True
 
-def match(company_name: str, min_score: int = 82) -> str | None:
+
+def match(company_name: str, min_score: int = FUZZY_CUTOFF) -> str | None:
     """
     Resolves a company name to an NSE trading symbol.
-    Uses exact lookup first, followed by rapidfuzz fuzzy matching.
+    Returns None rather than a doubtful guess: a wrong symbol is worse than no signal.
     """
     if not company_name:
         return None
+
+    name = company_name.strip()
+    if _ENTITY_BLOCKLIST.search(name):
+        return None
+
     load_stocks()
     if not _NAMES:
         return None
 
-    cleaned = _clean_name(company_name)
+    # 1. Exact lookups (symbol, full name, normalised name)
+    if name.upper() in _EXACT_MAP:
+        return _EXACT_MAP[name.upper()]
+    if name.lower() in _EXACT_MAP:
+        return _EXACT_MAP[name.lower()]
 
-    # 1. Exact match checks
-    if company_name.upper() in _EXACT_MAP:
-        return _EXACT_MAP[company_name.upper()]
-    if company_name.lower() in _EXACT_MAP:
-        return _EXACT_MAP[company_name.lower()]
+    cleaned = _clean_name(name)
+    if len(cleaned) < MIN_CLEAN_LENGTH:
+        return None
     if cleaned in _EXACT_MAP:
         return _EXACT_MAP[cleaned]
 
-    # 2. Fuzzy match against cleaned names
-    match_result = process.extractOne(
-        cleaned,
-        _CLEANED_NAMES,
-        scorer=fuzz.token_sort_ratio,
-        score_cutoff=min_score
+    # 2. Fuzzy match on normalised names
+    hit = process.extractOne(
+        cleaned, _CLEANED_NAMES, scorer=fuzz.token_sort_ratio, score_cutoff=min_score
     )
+    if hit:
+        return _SYMBOLS[hit[2]]
 
-    if match_result:
-        matched_str, score, idx = match_result
-        return _SYMBOLS[idx]
-
-    # 3. Fallback fuzzy match against full original names
-    fallback_result = process.extractOne(
-        company_name,
-        _NAMES,
-        scorer=fuzz.WRatio,
-        score_cutoff=min_score
-    )
-    if fallback_result:
-        matched_str, score, idx = fallback_result
-        return _SYMBOLS[idx]
+    # 3. Strict token-set fallback for word-order and extra-token differences.
+    #    token_set_ratio, not WRatio: WRatio's partial matching let a shared
+    #    token like "India" pull unrelated companies over the line.
+    #    It scores a pure subset at 100 ("food" vs "bectors food specialities"),
+    #    so require >=2 tokens and a comparable candidate length.
+    q_tokens = cleaned.split()
+    if len(q_tokens) >= 2:
+        for cand, _score, idx in process.extract(
+            cleaned, _CLEANED_NAMES, scorer=fuzz.token_set_ratio,
+            limit=5, score_cutoff=STRICT_CUTOFF
+        ):
+            if abs(len(cand.split()) - len(q_tokens)) <= 1:
+                return _SYMBOLS[idx]
 
     return None
+
 
 if __name__ == "__main__":
     ensure_equity_file()
     load_stocks()
-    print(f"Loaded {len(_SYMBOLS)} NSE stocks.")
+    print(f"Loaded {len(_SYMBOLS)} NSE stocks.\n")
 
-    test_queries = [
-        "Tata Motors Limited",
-        "Infosys",
-        "Reliance Industries",
-        "Praj Industries",
-        "Bharat Electronics",
-        "Random Unlisted Corp",
+    # (query, expected symbol or None)
+    cases = [
+        ("Tata Motors Limited", "TMCV"),
+        ("Infosys", "INFY"),
+        ("Reliance Industries", "RELIANCE"),
+        ("Praj Industries", "PRAJIND"),
+        ("Bharat Electronics", "BEL"),
+        ("NTPC", "NTPC"),
+        ("State Bank of India", "SBIN"),
+        ("Life Insurance Corporation of India", "LICI"),
+        # Must NOT match: unlisted bodies and junk
+        ("Random Unlisted Corp", None),
+        ("Government of India", None),
+        ("Ministry of Steel", None),
+        ("National Highways Authority of India", None),
+        ("Food Corporation of India", None),
     ]
-    for q in test_queries:
-        sym = match(q)
-        print(f"'{q}' -> Symbol: {sym}")
+    failures = 0
+    for q, expected in cases:
+        got = match(q)
+        ok = got == expected
+        failures += not ok
+        print(f"[{'ok  ' if ok else 'FAIL'}] {q:38} -> {got}  (expected {expected})")
+    print("\nAll matcher tests passed." if not failures else f"\n{failures} matcher test(s) failed.")

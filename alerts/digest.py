@@ -16,11 +16,10 @@ if sys.platform == "win32":
         pass
 
 import db
-from analysis.scoring import level_from_score
+from analysis.scoring import PRICED_IN_PCT, level_from_score
 from macro.health_report import generate_health_summary
-from alerts.telegram import send_alert
+from alerts.telegram import send_alert, split_message
 
-TG_LIMIT = 4000
 ICONS = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "⚪"}
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -57,26 +56,13 @@ def fmt_stock(s: dict, level: str) -> str:
 
     sign = 1 if s["direction"] == "positive" else -1
     priced_in_warn = ""
-    if move_5d is not None and (move_5d * sign >= 8.0):
+    if move_5d is not None and (move_5d * sign >= PRICED_IN_PCT):
         priced_in_warn = f"\n   ⚠️ already {move_5d:+.1f}% in 5d (likely priced in)"
 
     return (
         f"{ICONS[level]} {dir_icon} <b>{esc(s['symbol'])}</b> (Score {s['final_score']} | {level}){market}{priced_in_warn}\n"
         f"   {esc(trunc(s['reason'], 160))}"
     )
-
-
-def chunk(parts: list[str], limit: int = TG_LIMIT) -> list[str]:
-    msgs, cur = [], ""
-    for p in parts:
-        if cur and len(cur) + len(p) + 2 > limit:
-            msgs.append(cur)
-            cur = p
-        else:
-            cur = f"{cur}\n\n{p}" if cur else p
-    if cur:
-        msgs.append(cur)
-    return msgs
 
 
 def build_daily_digest(hours: int = 24) -> list[str]:
@@ -134,7 +120,7 @@ def build_daily_digest(hours: int = 24) -> list[str]:
         parts.append("⚪ <b>Watch only (low score / unclear direction):</b> " + ", ".join(sorted(set(watch))))
 
     parts.append("💡 <i>From official public sources. Open the source link and validate before trading.</i>")
-    return chunk(parts)
+    return split_message("\n\n".join(parts))
 
 
 def dispatch_daily_digest() -> bool:
@@ -145,7 +131,16 @@ def dispatch_daily_digest() -> bool:
 
 
 if __name__ == "__main__":
+    import sys as _sys
+    from alerts.telegram import is_configured
+
     msgs = build_daily_digest()
     print("\n\n-----\n\n".join(msgs))
-    print("\nSending to Telegram...")
-    print("Digest dispatched!" if dispatch_daily_digest() else "Failed to dispatch digest.")
+    print(f"\n[{len(msgs)} message(s) built]")
+
+    if "--send" not in _sys.argv:
+        print("[INFO] Preview only. Pass --send to dispatch to Telegram.")
+    elif not is_configured():
+        print("[INFO] Telegram credentials not set in .env; cannot send.")
+    else:
+        print("Digest dispatched!" if dispatch_daily_digest() else "Failed to dispatch digest.")
